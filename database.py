@@ -48,6 +48,18 @@ CREATE TABLE IF NOT EXISTS user_settings (
 );
 ''')
 
+# Таблица расписания
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS schedule (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    event_date TEXT NOT NULL,  -- в формате 'YYYY-MM-DD'
+    event_time TEXT            -- в формате 'HH:MM', опционально
+);
+''')
+
 conn.commit()
 
 
@@ -165,3 +177,65 @@ def get_today_focus_time(user_id: int) -> float:
     )
     result = cursor.fetchone()
     return float(result[0]) if result and result[0] is not None else 0.0
+
+
+# --- Функции для работы с расписанием ---
+
+def add_event(user_id: int, title: str, event_date: str, event_time: str = None, description: str = None) -> int:
+    """
+    Сохраняет событие в таблицу schedule.
+    event_date: строка 'YYYY-MM-DD'
+    event_time: строка 'HH:MM' или None
+    description: строка или None
+    Возвращает ID нового события.
+    """
+    cursor.execute(
+        'INSERT INTO schedule (user_id, title, description, event_date, event_time) '
+        'VALUES (?, ?, ?, ?, ?)',
+        (user_id, title, description, event_date, event_time)
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_events_by_date(user_id: int, event_date: str) -> list[tuple]:
+    """
+    Возвращает список событий (id, title, description, event_time)
+    для пользователя на конкретную дату.
+    event_date: 'YYYY-MM-DD'
+    """
+    cursor.execute(
+        'SELECT id, title, description, event_time '
+        'FROM schedule '
+        'WHERE user_id = ? AND event_date = ? '
+        'ORDER BY event_time IS NULL, event_time ASC',
+        (user_id, event_date)
+    )
+    return cursor.fetchall()
+
+
+def get_all_events(user_id: int) -> list[tuple]:
+    """
+    Возвращает все события пользователя, отсортированные по дате и времени.
+    """
+    cursor.execute(
+        'SELECT id, title, description, event_date, event_time '
+        'FROM schedule '
+        'WHERE user_id = ? '
+        'ORDER BY event_date ASC, event_time IS NULL, event_time ASC',
+        (user_id,)
+    )
+    return cursor.fetchall()
+
+
+def delete_event(user_id: int, event_id: int) -> bool:
+    """
+    Удаляет событие по его ID (только если принадлежит данному user_id).
+    Возвращает True, если удалено (rowcount == 1), иначе False.
+    """
+    cursor.execute(
+        'DELETE FROM schedule WHERE user_id = ? AND id = ?',
+        (user_id, event_id)
+    )
+    conn.commit()
+    return cursor.rowcount == 1

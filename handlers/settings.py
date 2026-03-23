@@ -1,59 +1,63 @@
 from aiogram import Router
-from aiogram.types import Message
 from aiogram.filters import Command
-from database import get_user_mode, set_user_mode, get_daily_norm
+from aiogram.types import Message
+
+from database import get_daily_norm, get_user_mode, set_daily_norm, set_user_mode
+
 
 router = Router()
+AVAILABLE_MODES = {"deep": "Deep Work", "pomodoro": "Pomodoro"}
 
 
-@router.message(Command(commands=['settings']))
-async def cmd_settings(message: Message):
-    """
-    Показывает текущие настройки пользователя: режим и дневную норму часов.
-    """
+@router.message(Command("settings"))
+async def cmd_settings(message: Message) -> None:
     user_id = message.from_user.id
     mode = get_user_mode(user_id)
     norm = get_daily_norm(user_id)
-    if norm is None:
-        norm_display = 'не задана (используй /setnorm)'
-    else:
-        norm_display = f'{norm:.2f} ч.'
 
-    if mode == 'deep':
-        mode_display = 'Deep Work (4 ч работы + 1 ч перерыв)'
-    elif mode == 'pomodoro':
-        mode_display = 'Pomodoro (25 мин работы + 5 мин перерыва)'
-    else:
-        mode_display = f'Неизвестный ({mode})'
+    norm_text = "not set" if norm is None else f"{norm:.2f} h"
+    mode_text = AVAILABLE_MODES.get(mode, mode)
 
-    text = (
-        '⚙️ Текущие настройки:\n\n'
-        f'• Режим работы: {mode_display}\n'
-        f'• Дневная норма: {norm_display}\n\n'
-        'Чтобы сменить режим, используй команду:\n'
-        '/setmode <deep|pomodoro>\n'
-        'Пример: /setmode pomodoro'
+    await message.reply(
+        (
+            "<b>Current settings</b>\n"
+            f"Mode: <b>{mode_text}</b>\n"
+            f"Daily norm: <b>{norm_text}</b>\n\n"
+            "Commands:\n"
+            "/setmode <deep|pomodoro>\n"
+            "/setnorm <hours>"
+        ),
+        parse_mode="HTML",
     )
-    await message.reply(text)
 
 
-@router.message(Command(commands=['setmode']))
-async def cmd_setmode(message: Message):
-    """
-    Позволяет переключить режим работы: 'deep' или 'pomodoro'.
-    Пример: /setmode pomodoro
-    """
-    parts = message.text.split()
-    if len(parts) != 2 or parts[1].lower() not in ['deep', 'pomodoro']:
-        return await message.reply(
-            '⚠️ Использование: /setmode <deep|pomodoro>\n'
-            'Где:\n'
-            '  deep      — Deep Work (4 ч работы + 1 ч перерыв)\n'
-            '  pomodoro  — Pomodoro (25 мин работы + 5 мин перерыва)'
-        )
-    mode = parts[1].lower()
+@router.message(Command("setmode"))
+async def cmd_setmode(message: Message) -> None:
+    mode = message.text.partition(" ")[2].strip().lower()
+    if mode not in AVAILABLE_MODES:
+        await message.reply("Usage: /setmode <deep|pomodoro>")
+        return
+
     set_user_mode(message.from_user.id, mode)
-    if mode == 'deep':
-        await message.reply('✅ Режим изменён на Deep Work (4 ч работы + 1 ч перерыв).')
-    else:
-        await message.reply('✅ Режим изменён на Pomodoro (25 мин работы + 5 мин перерыва).')
+    await message.reply(f"Work mode updated: {AVAILABLE_MODES[mode]}")
+
+
+@router.message(Command("setnorm"))
+async def cmd_setnorm(message: Message) -> None:
+    value = message.text.partition(" ")[2].strip()
+    if not value:
+        await message.reply("Usage: /setnorm <hours>")
+        return
+
+    try:
+        hours = float(value)
+    except ValueError:
+        await message.reply("Daily norm must be a number, for example: /setnorm 4.5")
+        return
+
+    if hours <= 0:
+        await message.reply("Daily norm must be greater than zero.")
+        return
+
+    set_daily_norm(message.from_user.id, hours)
+    await message.reply(f"Daily norm saved: {hours:.2f} h")

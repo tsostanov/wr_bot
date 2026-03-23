@@ -1,155 +1,157 @@
-from aiogram import Router, F
-from aiogram.types import Message
+from datetime import datetime, time, timedelta
+from html import escape
+
+from aiogram import Router
 from aiogram.filters import Command
-from datetime import datetime, timedelta
-from database import add_event, get_events_by_date, get_all_events, delete_event
+from aiogram.types import Message
+
+from database import add_event, delete_event, get_all_events, get_events_by_date
+
 
 router = Router()
 
 
-@router.message(Command(commands=['add_event']))
-async def cmd_add_event(message: Message):
-    """
-    Добавляет новое событие в расписание.
-    Формат:
-    /add_event 2025-06-05 14:00 Название события | Описание (опционально)
+def format_event_line(event_id: int, title: str, description: str | None, event_time: str | None) -> str:
+    line = f"[{event_id}] <b>{escape(title)}</b>"
+    if event_time:
+        line += f" at <code>{event_time}</code>"
+    if description:
+        line += f" - {escape(description)}"
+    return line
 
-    Примеры:
-    /add_event 2025-06-05 14:00 Собеседование в Яндексе | Приготовить резюме
-    /add_event 2025-06-07 09:00 Экзамен по математике
-    /add_event 2025-06-10 Сдача проекта
-    """
-    text = message.text.partition(' ')[2].strip()
-    if not text:
-        return await message.reply(
-            "⚠️ Использование: /add_event <YYYY-MM-DD> <HH:MM> Название | Описание (опционально)\n"
-            "Пример: /add_event 2025-06-05 14:00 Собеседование в Яндексе | Приготовить резюме"
+
+@router.message(Command("add_event"))
+async def cmd_add_event(message: Message) -> None:
+    payload = message.text.partition(" ")[2].strip()
+    if not payload:
+        await message.reply(
+            "Usage: /add_event <YYYY-MM-DD> [HH:MM] <title> | <description>"
         )
+        return
 
-    parts = text.split(' ', 2)
+    parts = payload.split(" ", 2)
     if len(parts) < 2:
-        return await message.reply("⚠️ Ошибка формата. См.: /add_event YYYY-MM-DD HH:MM Название | Описание")
+        await message.reply(
+            "Usage: /add_event <YYYY-MM-DD> [HH:MM] <title> | <description>"
+        )
+        return
 
-    date_part = parts[0]
-    time_part = parts[1]
-    remainder = parts[2] if len(parts) == 3 else ''
+    event_date = parts[0]
+    remainder = ""
+    event_time = None
 
     try:
-        datetime.strptime(date_part, '%Y-%m-%d')
+        datetime.strptime(event_date, "%Y-%m-%d")
     except ValueError:
-        return await message.reply("⚠️ Неверный формат даты. Используйте YYYY-MM-DD")
+        await message.reply("Date must be in YYYY-MM-DD format.")
+        return
 
-    event_time = None
-    if time_part != '':
+    possible_time = parts[1]
+    if len(parts) == 3:
         try:
-            datetime.strptime(time_part, '%H:%M')
-            event_time = time_part
+            datetime.strptime(possible_time, "%H:%M")
+            event_time = possible_time
+            remainder = parts[2]
         except ValueError:
-            event_time = None
-            remainder = ' '.join([time_part, remainder]).strip()
-
-    if '|' in remainder:
-        title_part, description_part = map(str.strip, remainder.split('|', 1))
+            remainder = " ".join(parts[1:])
     else:
-        title_part = remainder.strip()
-        description_part = None
+        try:
+            datetime.strptime(possible_time, "%H:%M")
+            await message.reply("Event title is required after the time.")
+            return
+        except ValueError:
+            remainder = possible_time
 
-    if not title_part:
-        return await message.reply("⚠️ Название не может быть пустым. Формат: /add_event YYYY-MM-DD HH:MM Название | Описание")
+    if "|" in remainder:
+        title, description = [part.strip() for part in remainder.split("|", 1)]
+    else:
+        title = remainder.strip()
+        description = None
+
+    if not title:
+        await message.reply("Event title cannot be empty.")
+        return
 
     event_id = add_event(
         user_id=message.from_user.id,
-        title=title_part,
-        event_date=date_part,
+        title=title,
+        event_date=event_date,
         event_time=event_time,
-        description=description_part
+        description=description,
     )
-    reply_text = f"✅ Событие добавлено (ID {event_id}):\n• *{title_part}* — {date_part}"
+
+    text = [f"Event added with ID <b>{event_id}</b>"]
+    text.append(f"Title: <b>{escape(title)}</b>")
+    text.append(f"Date: <code>{event_date}</code>")
     if event_time:
-        reply_text += f" в {event_time}"
-    if description_part:
-        reply_text += f"\n• Описание: {description_part}"
-    await message.reply(reply_text, parse_mode='Markdown')
+        text.append(f"Time: <code>{event_time}</code>")
+    if description:
+        text.append(f"Description: {escape(description)}")
+
+    await message.reply("\n".join(text), parse_mode="HTML")
 
 
-@router.message(Command(commands=['schedule']))
-async def cmd_schedule(message: Message):
-    """
-    Показывает расписание на сегодня и завтра.
-    """
-    user_id = message.from_user.id
-    today = datetime.now().strftime('%Y-%m-%d')
-    tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+@router.message(Command("schedule"))
+async def cmd_schedule(message: Message) -> None:
+    today = datetime.now().date()
+    tomorrow = today + timedelta(days=1)
 
-    events_today = get_events_by_date(user_id, today)
-    events_tomorrow = get_events_by_date(user_id, tomorrow)
+    sections = []
+    for label, day in (("Today", today), ("Tomorrow", tomorrow)):
+        events = get_events_by_date(message.from_user.id, day.isoformat())
+        lines = [f"<b>{label}</b> ({day.isoformat()})"]
+        if events:
+            for event_id, title, description, event_time in events:
+                lines.append(format_event_line(event_id, title, description, event_time))
+        else:
+            lines.append("No events.")
+        sections.append("\n".join(lines))
 
-    reply_text = f"📅 *Расписание на сегодня* ({today}):\n"
-    if events_today:
-        for ev_id, title, desc, ev_time in events_today:
-            line = f"— [{ev_id}] {title}"
-            if ev_time:
-                line += f" в {ev_time}"
-            if desc:
-                line += f" | {desc}"
-            reply_text += line + "\n"
-    else:
-        reply_text += "Нет событий.\n"
-
-    reply_text += f"\n📅 *Расписание на завтра* ({tomorrow}):\n"
-    if events_tomorrow:
-        for ev_id, title, desc, ev_time in events_tomorrow:
-            line = f"— [{ev_id}] {title}"
-            if ev_time:
-                line += f" в {ev_time}"
-            if desc:
-                line += f" | {desc}"
-            reply_text += line + "\n"
-    else:
-        reply_text += "Нет событий.\n"
-
-    await message.reply(reply_text, parse_mode='Markdown')
+    await message.reply("\n\n".join(sections), parse_mode="HTML")
 
 
-@router.message(Command(commands=['my_events']))
-async def cmd_my_events(message: Message):
-    """
-    Показывает все будущие события пользователя (отсортированы по дате/времени).
-    """
-    user_id = message.from_user.id
-    all_events = get_all_events(user_id)
+@router.message(Command("my_events"))
+async def cmd_my_events(message: Message) -> None:
+    now = datetime.now()
+    events = get_all_events(message.from_user.id)
+    upcoming = []
 
-    if not all_events:
-        return await message.reply("📋 У вас нет событий в расписании.")
+    for event_id, title, description, event_date, event_time in events:
+        day = datetime.strptime(event_date, "%Y-%m-%d").date()
+        if event_time:
+            event_moment = datetime.combine(day, time.fromisoformat(event_time))
+        else:
+            event_moment = datetime.combine(day, time.max)
 
-    reply_text = "📋 *Все ваши предстоящие события:*\n"
-    now = datetime.now().strftime('%Y-%m-%d')
-    for ev_id, title, desc, ev_date, ev_time in all_events:
-        if ev_date < now:
-            continue
-        line = f"— [{ev_id}] {title} — {ev_date}"
-        if ev_time:
-            line += f" в {ev_time}"
-        if desc:
-            line += f" | {desc}"
-        reply_text += line + "\n"
+        if event_moment >= now:
+            upcoming.append((event_id, title, description, event_date, event_time))
 
-    await message.reply(reply_text, parse_mode='Markdown')
+    if not upcoming:
+        await message.reply("You have no upcoming events.")
+        return
+
+    lines = ["<b>Upcoming events</b>"]
+    for event_id, title, description, event_date, event_time in upcoming:
+        line = f"[{event_id}] <b>{escape(title)}</b> on <code>{event_date}</code>"
+        if event_time:
+            line += f" at <code>{event_time}</code>"
+        if description:
+            line += f" - {escape(description)}"
+        lines.append(line)
+
+    await message.reply("\n".join(lines), parse_mode="HTML")
 
 
-@router.message(Command(commands=['delete_event']))
-async def cmd_delete_event(message: Message):
-    """
-    Удаляет событие по ID:
-    /delete_event 5
-    """
-    arg = message.text.partition(' ')[2].strip()
+@router.message(Command("delete_event"))
+async def cmd_delete_event(message: Message) -> None:
+    arg = message.text.partition(" ")[2].strip()
     if not arg.isdigit():
-        return await message.reply("⚠️ Использование: /delete_event <id_события> (например: /delete_event 5)")
+        await message.reply("Usage: /delete_event <event_id>")
+        return
 
-    ev_id = int(arg)
-    success = delete_event(message.from_user.id, ev_id)
-    if success:
-        await message.reply(f"✅ Событие {ev_id} удалено.")
-    else:
-        await message.reply(f"❌ Событие {ev_id} не найдено или не принадлежит вам.")
+    event_id = int(arg)
+    if delete_event(message.from_user.id, event_id):
+        await message.reply(f"Event {event_id} deleted.")
+        return
+
+    await message.reply("Event not found.")

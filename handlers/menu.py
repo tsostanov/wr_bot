@@ -1,126 +1,129 @@
 from aiogram import Router
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
+
 
 router = Router()
 
-# FSM-состояния
+MAIN_MENU_BUTTON = "Back to main menu"
 
 
 class MenuState(StatesGroup):
-    CHOOSING_SECTION = State()
-    PLANNING = State()
-    LEARNING = State()
-    EVENTS = State()
-
-# === Главное меню ===
+    choosing_section = State()
+    planning = State()
+    learning = State()
+    events = State()
 
 
-@router.message(Command('start', 'help'))
-async def cmd_start(message: Message, state: FSMContext):
-    kb = ReplyKeyboardMarkup(
+def build_main_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text='📋 Планировать')],
-            [KeyboardButton(text='📖 Учиться')],
-            [KeyboardButton(text='🗓️ События')],
+            [KeyboardButton(text="Plan")],
+            [KeyboardButton(text="Focus")],
+            [KeyboardButton(text="Events")],
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
+
+
+def build_section_menu(rows: list[list[str]]) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=text) for text in row] for row in rows],
+        resize_keyboard=True,
+    )
+
+
+@router.message(Command("start", "help"))
+async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await state.set_state(MenuState.CHOOSING_SECTION)
-    text = (
-        "👋 Привет! Выбери раздел:\n\n"
-        "📋 Планировать — задачи и дедлайны\n"
-        "📖 Учиться — Deep Work / Pomodoro / отчёты\n"
-        "🗓️ События — расписание и важные даты"
+    await state.set_state(MenuState.choosing_section)
+    await message.answer(
+        (
+            "Choose a section:\n\n"
+            "Plan -> tasks and daily queue\n"
+            "Focus -> timers, report, work mode\n"
+            "Events -> schedule and important dates"
+        ),
+        reply_markup=build_main_menu(),
     )
-    await message.answer(text, reply_markup=kb)
-
-# === Выбор раздела ===
 
 
-@router.message(MenuState.CHOOSING_SECTION)
-async def choose_section(message: Message, state: FSMContext):
-    text = message.text.strip().lower()
+@router.message(MenuState.choosing_section)
+async def choose_section(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip().lower()
 
-    if text == '📋 планировать':
-        await state.set_state(MenuState.PLANNING)
-        kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text='/add'), KeyboardButton(text='/list')],
-                [KeyboardButton(text='/today'), KeyboardButton(text='/done')],
-                [KeyboardButton(text='◀️ Главное меню')]
-            ],
-            resize_keyboard=True
-        )
+    if text == "plan":
+        await state.set_state(MenuState.planning)
         await message.answer(
-            "<b>📋 Раздел «Планировать»</b>\n\n"
-            "/add — добавить задачу\n"
-            "/list — показать все задачи\n"
-            "/today — задачи на сегодня\n"
-            "/done — отметить задачу выполненной",
-            reply_markup=kb,
-            parse_mode='HTML'
+            (
+                "Planning section\n\n"
+                "/add <text> -> add a task\n"
+                "/list -> show all tasks\n"
+                "/today -> show pending tasks for focus\n"
+                "/done <id> -> mark task as done\n"
+                "/archive -> show archive summary"
+            ),
+            reply_markup=build_section_menu(
+                [
+                    ["/add", "/list"],
+                    ["/today", "/done"],
+                    ["/archive", MAIN_MENU_BUTTON],
+                ]
+            ),
         )
         return
 
-    if text == '📖 учиться':
-        await state.set_state(MenuState.LEARNING)
-        kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text='/setnorm'),
-                 KeyboardButton(text='/report')],
-                [KeyboardButton(text='/start_timer'),
-                 KeyboardButton(text='/stop_timer')],
-                [KeyboardButton(text='◀️ Главное меню')]
-            ],
-            resize_keyboard=True
-        )
+    if text == "focus":
+        await state.set_state(MenuState.learning)
         await message.answer(
-            "<b>📖 Раздел «Учиться»</b>\n\n"
-            "/setnorm — задать норму работы в день\n"
-            "/report — показать отчёт по Deep Work сегодня\n"
-            "/start_timer — запустить Deep Work / Pomodoro\n"
-            "/stop_timer — остановить текущий таймер",
-            reply_markup=kb,
-            parse_mode='HTML'
+            (
+                "Focus section\n\n"
+                "/start_timer [task_id] -> start a timer\n"
+                "/stop_timer -> stop current timer\n"
+                "/report -> today's focus report\n"
+                "/setnorm <hours> -> set daily focus norm\n"
+                "/settings -> current settings\n"
+                "/setmode <deep|pomodoro> -> switch mode"
+            ),
+            reply_markup=build_section_menu(
+                [
+                    ["/start_timer", "/stop_timer"],
+                    ["/report", "/setnorm"],
+                    ["/settings", "/setmode"],
+                    [MAIN_MENU_BUTTON],
+                ]
+            ),
         )
         return
 
-    if text == '🗓️ события':
-        await state.set_state(MenuState.EVENTS)
-        kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text='/add_event'),
-                 KeyboardButton(text='/schedule')],
-                [KeyboardButton(text='/my_events'),
-                 KeyboardButton(text='/delete_event')],
-                [KeyboardButton(text='◀️ Главное меню')]
-            ],
-            resize_keyboard=True
-        )
+    if text == "events":
+        await state.set_state(MenuState.events)
         await message.answer(
-            "<b>🗓️ Раздел «События»</b>\n\n"
-            "/add_event — добавить событие\n"
-            "/schedule — показать расписание на сегодня и завтра\n"
-            "/my_events — показать все будущие события\n"
-            "/delete_event — удалить событие по ID",
-            reply_markup=kb,
-            parse_mode='HTML'
+            (
+                "Events section\n\n"
+                "/add_event <date> [time] <title> | <description>\n"
+                "/schedule -> today and tomorrow\n"
+                "/my_events -> upcoming events\n"
+                "/delete_event <id> -> delete an event"
+            ),
+            reply_markup=build_section_menu(
+                [
+                    ["/add_event", "/schedule"],
+                    ["/my_events", "/delete_event"],
+                    [MAIN_MENU_BUTTON],
+                ]
+            ),
         )
         return
 
-    # Если пользователь нажал что-то не из кнопок
-    await message.reply("⚠️ Пожалуйста, выбери один из разделов, используя кнопки ниже.")
-
-# === Возврат в главное меню ===
+    await message.reply("Use the keyboard buttons to pick a section.")
 
 
-@router.message(lambda message: not message.text.startswith('/'), MenuState.PLANNING)
-@router.message(lambda message: not message.text.startswith('/'), MenuState.LEARNING)
-@router.message(lambda message: not message.text.startswith('/'), MenuState.EVENTS)
-async def back_to_main(message: Message, state: FSMContext):
-    if message.text.strip() == '◀️ Главное меню':
+@router.message(MenuState.planning)
+@router.message(MenuState.learning)
+@router.message(MenuState.events)
+async def back_to_main(message: Message, state: FSMContext) -> None:
+    if (message.text or "").strip() == MAIN_MENU_BUTTON:
         await cmd_start(message, state)

@@ -1,223 +1,327 @@
 import asyncio
-from aiogram import Router, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.filters import Command
-from database import (
-    list_tasks,
-    set_daily_norm,
-    get_daily_norm,
-    log_focus_session,
-    get_today_focus_time,
-)
+import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from html import escape
 
+from aiogram import F, Router
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+from config import TEST_MODE
+from database import (
+    get_daily_norm,
+    get_task,
+    get_today_focus_time,
+    get_user_mode,
+    list_tasks,
+    log_focus_session,
+)
+
+
+logger = logging.getLogger(__name__)
 router = Router()
 
-# Словарь для хранения активных asyncio.Task по Deep Work для каждого пользователя:
-# ключ = user_id, значение = {"task": asyncio.Task, "message_id": int, "chat_id": int, "start_time": datetime}
-active_timers: dict[int, dict] = {}
 
-# Флаг для тестирования: если True, 4 ч = 4 сек, 1 ч = 1 сек
-TEST_MODE = False
+class FocusState(StatesGroup):
+    waiting_for_task_id = State()
 
 
-@router.message(Command(commands=['setnorm']))
-async def cmd_setnorm(message: Message):
-    """
-    Устанавливает дневную норму часов. Пример: /setnorm 5.0
-    """
-    parts = message.text.split()
-    if len(parts) != 2:
-        return await message.reply('⚠️ Использование: /setnorm <часы> (например: /setnorm 5.0)')
-    try:
-        hours = float(parts[1])
-    except ValueError:
-        return await message.reply('⚠️ Введи число, например: /setnorm 4.0')
-    set_daily_norm(message.from_user.id, hours)
-    await message.reply(f'✅ Норма на день установлена: {hours:.2f} ч.')
+@dataclass
+class TimerPreset:
+    mode: str
+    label: str
+    work_seconds: int
+    work_hours: float
+    break_seconds: int
+    break_label: str
 
 
-@router.message(Command(commands=['today']))
-async def cmd_today_focus(message: Message):
-    """
-    Показывает список активных задач и предлагает выбрать ID для real Deep Work (4 ч работы + 1 ч перерыв).
-    """
-    tasks = list_tasks(message.from_user.id, include_done=False)
-    if not tasks:
-        return await message.reply('📅 Нет активных задач для Deep Work.')
-    text = '📅 Задачи на сегодня:\n'
-    for tid, title, _ in tasks:
-        text += f'{tid}. {title}\n'
-    text += '\n👉 Отправь ID задачи (цифру), чтобы начать Deep Work (4 ч).'
-    await message.reply(text)
+@dataclass
+class ActiveTimer:
+    task: asyncio.Task
+    mode: str
+    label: str
+    task_title: str
+    chat_id: int
+    message_id: int
+    started_at: datetime
+    work_seconds: int
+    work_hours: float
+    break_seconds: int
+    break_label: str
 
 
-@router.message(F.text.regexp(r'^\d+$'))
-async def start_real_timer(message: Message):
-    """
-    Пользователь отправляет ID (цифру) — запускаем «реальный» таймер Deep Work (4 ч) для этой задачи.
-    """
-    user_id = message.from_user.id
-    if user_id in active_timers:
-        return await message.reply('⚠️ У тебя уже запущен таймер. Сначала останови текущий (кнопка «⏹️»).')
+active_timers: dict[int, ActiveTimer] = {}
 
-    tid = int(message.text)
-    tasks = list_tasks(user_id, include_done=False)
-    task = next((t for t in tasks if t[0] == tid), None)
-    if not task:
-        return await message.reply('⚠️ Неверный ID задачи. Повтори команду /today и выбери существующий ID.')
-    title = task[1]
 
-    kb = InlineKeyboardMarkup(
+def get_timer_preset(mode: str) -> TimerPreset:
+    if mode == "pomodoro":
+        return TimerPreset(
+            mode="pomodoro",
+            label="Pomodoro",
+            work_seconds=5 if TEST_MODE else 25 * 60,
+            work_hours=25 / 60,
+            break_seconds=3 if TEST_MODE else 5 * 60,
+            break_label="short break",
+        )
+
+    return TimerPreset(
+        mode="deep",
+        label="Deep Work",
+        work_seconds=10 if TEST_MODE else 4 * 3600,
+        work_hours=4.0,
+        break_seconds=5 if TEST_MODE else 3600,
+        break_label="recovery break",
+    )
+
+
+def build_stop_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(
-                text='⏹️ Остановить таймер', callback_data=f'stop_timer:{user_id}')]
+            [InlineKeyboardButton(text="Stop timer", callback_data=f"stop_timer:{user_id}")]
         ]
     )
 
-    total_seconds = 4 if TEST_MODE else 4 * 3600
-    display = '00:00:04' if TEST_MODE else '04:00:00'
+
+def format_duration(seconds: int) -> str:
+    hours, remainder = divmod(max(seconds, 0), 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def build_task_selection_text(tasks: list[tuple[int, str, str]], mode: str) -> str:
+    lines = [f"<b>Pending tasks for {escape(mode)}</b>"]
+    for task_id, title, _ in tasks:
+        lines.append(f"{task_id}. {escape(title)}")
+    lines.append("")
+    lines.append("Send the task ID or use /start_timer <id>.")
+    return "\n".join(lines)
+
+
+async def start_timer_for_task(message: Message, task_id: int, state: FSMContext) -> None:
+    user_id = message.from_user.id
+    if user_id in active_timers:
+        await message.reply("You already have an active timer. Use /stop_timer first.")
+        return
+
+    task = get_task(user_id, task_id)
+    if task is None or task[2] == "done":
+        await message.reply("Task not found or already done. Use /today to refresh the list.")
+        return
+
+    preset = get_timer_preset(get_user_mode(user_id))
+    task_title = task[1]
+
     sent = await message.reply(
-        f'🧠 Deep Work стартовал по задаче: "{title}"\n⏱️ Время осталось: {display}',
-        reply_markup=kb
+        (
+            f"<b>{preset.label}</b> started for task: <b>{escape(task_title)}</b>\n"
+            f"Time left: <code>{format_duration(preset.work_seconds)}</code>"
+        ),
+        parse_mode="HTML",
+        reply_markup=build_stop_keyboard(user_id),
     )
 
-    start_time = datetime.now()
-    task_obj = asyncio.create_task(
-        deep_work_countdown(
+    started_at = datetime.now()
+    timer_task = asyncio.create_task(
+        run_timer(
             bot=message.bot,
+            user_id=user_id,
             chat_id=sent.chat.id,
             message_id=sent.message_id,
-            user_id=user_id,
-            title=title,
-            start_time=start_time
+            task_title=task_title,
+            preset=preset,
         )
     )
-    active_timers[user_id] = {
-        "task": task_obj,
-        "message_id": sent.message_id,
-        "chat_id": sent.chat.id,
-        "start_time": start_time
-    }
+    active_timers[user_id] = ActiveTimer(
+        task=timer_task,
+        mode=preset.mode,
+        label=preset.label,
+        task_title=task_title,
+        chat_id=sent.chat.id,
+        message_id=sent.message_id,
+        started_at=started_at,
+        work_seconds=preset.work_seconds,
+        work_hours=preset.work_hours,
+        break_seconds=preset.break_seconds,
+        break_label=preset.break_label,
+    )
+    await state.clear()
 
 
-async def deep_work_countdown(bot, chat_id: int, message_id: int, user_id: int, title: str, start_time: datetime):
-    """
-    Фоновый цикл, который каждую секунду уменьшает оставшееся время,
-    редактирует сообщение. Когда таймер доходит до нуля,
-    логирует в архив и уведомляет о начале перерыва (1 ч).
-    """
-    total_seconds = 4 if TEST_MODE else 4 * 3600
-    elapsed = 0
+async def update_timer_message(bot, timer: ActiveTimer, remaining: int, user_id: int) -> None:
+    try:
+        await bot.edit_message_text(
+            chat_id=timer.chat_id,
+            message_id=timer.message_id,
+            text=(
+                f"<b>{timer.label}</b> in progress for task: <b>{escape(timer.task_title)}</b>\n"
+                f"Time left: <code>{format_duration(remaining)}</code>"
+            ),
+            parse_mode="HTML",
+            reply_markup=build_stop_keyboard(user_id),
+        )
+    except Exception:
+        logger.exception("Failed to update timer message for user %s", user_id)
+
+
+async def run_timer(bot, user_id: int, chat_id: int, message_id: int, task_title: str, preset: TimerPreset) -> None:
+    deadline = datetime.now() + timedelta(seconds=preset.work_seconds)
+    update_step = 1 if TEST_MODE else 60
 
     try:
-        while elapsed < total_seconds:
-            await asyncio.sleep(1)
-            elapsed += 1
-            remaining = total_seconds - elapsed
-            hrs = remaining // 3600
-            mins = (remaining % 3600) // 60
-            secs = remaining % 60
-            if TEST_MODE:
-                display = f'00:00:0{remaining}'
-            else:
-                display = f'{hrs:02d}:{mins:02d}:{secs:02d}'
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=(
-                        f'🧠 Deep Work по задаче: "{title}"\n'
-                        f'⏱️ Время осталось: {display}'
-                    ),
-                    reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [InlineKeyboardButton(
-                                text='⏹️ Остановить таймер', callback_data=f'stop_timer:{user_id}')]
-                        ]
-                    )
-                )
-            except:
-                pass
+        while True:
+            remaining = int((deadline - datetime.now()).total_seconds())
+            if remaining <= 0:
+                break
 
-        log_focus_session(user_id, title, 4.0)
+            await asyncio.sleep(min(update_step, remaining))
+            remaining = int((deadline - datetime.now()).total_seconds())
+            timer = active_timers.get(user_id)
+            if timer is None:
+                return
+            await update_timer_message(bot, timer, remaining, user_id)
+
+        log_focus_session(
+            user_id=user_id,
+            task_title=task_title,
+            hours=preset.work_hours,
+            comment=f"{preset.label} completed",
+        )
         await bot.send_message(
             chat_id=chat_id,
             text=(
-                f'✅ Deep Work (4 ч) по задаче "{title}" завершён и записан в архив.\n'
-                f'⏳ Начинается перерыв 1 ч.'
-            )
+                f"<b>{preset.label}</b> completed for task: <b>{escape(task_title)}</b>\n"
+                f"Logged focus time: <b>{preset.work_hours:.2f} h</b>\n"
+                f"Recommended next step: {preset.break_label} for {format_duration(preset.break_seconds)}"
+            ),
+            parse_mode="HTML",
         )
-
-        break_seconds = 1 if TEST_MODE else 3600
-        await asyncio.sleep(break_seconds)
-
-        await bot.send_message(
-            chat_id=chat_id,
-            text='⏰ Перерыв (1 ч) завершён. Готов к следующей Deep Work сессии!'
-        )
-
     except asyncio.CancelledError:
-        return
+        logger.info("Timer cancelled for user %s", user_id)
+        raise
     finally:
         active_timers.pop(user_id, None)
 
 
-@router.callback_query(F.data.startswith('stop_timer:'))
-async def cmd_stop_timer(callback: CallbackQuery):
-    """
-    Обработка нажатия кнопки «Остановить таймер». Отменяем задачу,
-    считаем, сколько успел сделать, и записываем это в архив.
-    """
-    data = callback.data
-    try:
-        _, uid_str = data.split(':')
-        user_id = int(uid_str)
-    except:
-        return await callback.answer()
+async def stop_active_timer(user_id: int) -> tuple[ActiveTimer, float] | None:
+    timer = active_timers.get(user_id)
+    if timer is None:
+        return None
 
-    if user_id not in active_timers:
-        return await callback.answer('⚠️ У тебя нет активного таймера.', show_alert=True)
+    timer.task.cancel()
+    elapsed_seconds = max(0, int((datetime.now() - timer.started_at).total_seconds()))
+    completed_ratio = min(1.0, elapsed_seconds / timer.work_seconds) if timer.work_seconds else 0.0
+    spent_hours = timer.work_hours * completed_ratio
 
-    rec = active_timers[user_id]
-    task_obj = rec['task']
-    start_time = rec['start_time']
-    chat_id = rec['chat_id']
+    log_focus_session(
+        user_id=user_id,
+        task_title=timer.task_title,
+        hours=spent_hours,
+        comment=f"{timer.label} interrupted",
+    )
+    active_timers.pop(user_id, None)
+    return timer, spent_hours
 
-    task_obj.cancel()
 
-    now = datetime.now()
-    diff = now - start_time
-    seconds_done = diff.seconds
+@router.message(Command("today"))
+async def cmd_today(message: Message, state: FSMContext) -> None:
+    tasks = list_tasks(message.from_user.id, include_done=False)
+    if not tasks:
+        await message.reply("You have no pending tasks.")
+        return
 
-    hours_done = round(seconds_done / 3600, 2)
+    mode = get_timer_preset(get_user_mode(message.from_user.id)).label
+    await state.set_state(FocusState.waiting_for_task_id)
+    await message.reply(build_task_selection_text(tasks, mode), parse_mode="HTML")
 
-    log_focus_session(user_id, f'Deep Work (прервано)', hours_done)
 
-    await callback.message.reply(
-        f'⏹️ Таймер остановлен. Ты успел провести Deep Work: {hours_done:.2f} ч. '
-        f'Это время записано в архив.'
+@router.message(Command("start_timer"))
+async def cmd_start_timer(message: Message, state: FSMContext) -> None:
+    arg = message.text.partition(" ")[2].strip()
+    if not arg:
+        await cmd_today(message, state)
+        return
+
+    if not arg.isdigit():
+        await message.reply("Usage: /start_timer <task_id>")
+        return
+
+    await start_timer_for_task(message, int(arg), state)
+
+
+@router.message(Command("stop_timer"))
+async def cmd_stop_timer_message(message: Message, state: FSMContext) -> None:
+    stopped = await stop_active_timer(message.from_user.id)
+    await state.clear()
+    if stopped is None:
+        await message.reply("You do not have an active timer.")
+        return
+
+    timer, spent_hours = stopped
+    await message.reply(
+        (
+            f"<b>{timer.label}</b> stopped.\n"
+            f"Task: <b>{escape(timer.task_title)}</b>\n"
+            f"Logged focus time: <b>{spent_hours:.2f} h</b>"
+        ),
+        parse_mode="HTML",
     )
 
-    active_timers.pop(user_id, None)
 
+@router.message(FocusState.waiting_for_task_id, F.text.regexp(r"^\d+$"))
+async def start_timer_from_state(message: Message, state: FSMContext) -> None:
+    await start_timer_for_task(message, int(message.text), state)
+
+
+@router.callback_query(F.data.startswith("stop_timer:"))
+async def cmd_stop_timer_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    try:
+        _, user_id_text = callback.data.split(":")
+        timer_owner_id = int(user_id_text)
+    except ValueError:
+        await callback.answer()
+        return
+
+    if callback.from_user.id != timer_owner_id:
+        await callback.answer("This timer belongs to another user.", show_alert=True)
+        return
+
+    stopped = await stop_active_timer(timer_owner_id)
+    await state.clear()
+    if stopped is None:
+        await callback.answer("There is no active timer.", show_alert=True)
+        return
+
+    timer, spent_hours = stopped
+    await callback.message.reply(
+        (
+            f"<b>{timer.label}</b> stopped.\n"
+            f"Task: <b>{escape(timer.task_title)}</b>\n"
+            f"Logged focus time: <b>{spent_hours:.2f} h</b>"
+        ),
+        parse_mode="HTML",
+    )
     await callback.answer()
 
 
-@router.message(Command(commands=['report']))
-async def cmd_report(message: Message):
-    """
-    Показывает, сколько Deep Work-часов сделано за сегодня и сравнивает с дневной нормой.
-    """
-    today_time = get_today_focus_time(message.from_user.id)
-    norm = get_daily_norm(message.from_user.id)
-    text = f'📊 Сегодня ты вложил в Deep Work: {today_time:.2f} ч.\n'
-    if norm is not None:
-        diff = norm - today_time
-        if diff > 0:
-            text += f'🔽 До нормы осталось: {diff:.2f} ч.'
-        else:
-            text += '✅ Норма выполнена или перевыполнена!'
+@router.message(Command("report"))
+async def cmd_report(message: Message) -> None:
+    today = datetime.now().date().isoformat()
+    focus_hours = get_today_focus_time(message.from_user.id, today)
+    daily_norm = get_daily_norm(message.from_user.id)
+
+    lines = [f"Today's focus time: <b>{focus_hours:.2f} h</b>"]
+
+    if daily_norm is None:
+        lines.append("Daily norm is not set. Use /setnorm <hours>.")
     else:
-        text += '⚠️ Норма на день не установлена. Задай через /setnorm <часы>, например: /setnorm 5.0'
-    await message.reply(text)
+        remaining = daily_norm - focus_hours
+        if remaining > 0:
+            lines.append(f"Remaining to norm: <b>{remaining:.2f} h</b>")
+        else:
+            lines.append("Daily norm achieved.")
+
+    await message.reply("\n".join(lines), parse_mode="HTML")
